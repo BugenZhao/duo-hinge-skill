@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Folds and unfolds a booted iPhone Duo simulator without Device Hub.
+# Folds and unfolds a booted iPhone Duo simulator without Device Hub, and drives Device Hub's
+# resizable mode (the frontmost app on a freely sized display) through `devicectl`.
 #
 #   duo-hinge open | close | half | set <degrees> | get | status
+#   duo-hinge resize start [WxH] | set <WxH> | get | stop
 #
 # Set DUO_HINGE_DEVICE to a UDID when several iPhone Duo simulators are booted.
 set -euo pipefail
@@ -40,6 +42,95 @@ helper_path() {
   echo "$bin"
 }
 
+# The actual size of the resizable display in points, measured from a screenshot: `devicectl` reports
+# only the requested size, and the system adjusts requests outside its limits.
+resizable_size() {
+  local shot scale
+  shot="$(mktemp -t duo-hinge-resize).png"
+  xcrun simctl io "$DEVICE" screenshot --display=resizable "$shot" >/dev/null 2>&1 || { rm -f "$shot"; return 1; }
+  scale="$(xcrun simctl io "$DEVICE" enumerate 2>/dev/null | awk '/Name: Resizable/ {f=1} f && /Preferred UI Scale/ {print $4; exit}')"
+  sips -g pixelWidth -g pixelHeight "$shot" | awk -v s="${scale:-3}" '/pixelWidth/ {w=$2} /pixelHeight/ {h=$2} END {printf "%gx%g\n", w/s, h/s}'
+  rm -f "$shot"
+}
+
+# Waits until two readings a second apart agree, so a resize animation has finished.
+settled_size() {
+  local previous="" current
+  for _ in 1 2 3 4 5 6 7 8; do
+    current="$(resizable_size)" || return 1
+    [[ "$current" == "$previous" ]] && { echo "$current"; return; }
+    previous="$current"
+    sleep 1
+  done
+  echo "$current"
+}
+
+# Requests a size and prints the settled actual size.
+apply_size() {
+  local before
+  before="$(resizable_size)"
+  xcrun devicectl device appResize set --device "$DEVICE" --preferred-size "$1" >/dev/null
+  # The resize starts a moment after `set` returns; wait for the size to leave the old one, up to
+  # 4 seconds, since an adjusted request can also land on the size already shown.
+  for _ in $(seq 1 8); do [[ "$(resizable_size)" != "$before" ]] && break; sleep 0.5; done
+  settled_size
+}
+
+session_active() {
+  xcrun devicectl device info appResize --device "$DEVICE" >/dev/null 2>&1
+}
+
+resize_pid_file() { echo "${TMPDIR:-/tmp}/duo-hinge/resize-$DEVICE.pid"; }
+
+resize() {
+  local size="${2:-}"
+  case "${1:-}" in
+    start)
+      [[ -z "$size" || "$size" =~ ^[0-9]+x[0-9]+$ ]] || die "resize start takes an optional <width>x<height> in points"
+      session_active && die "a resizable session is already running; use resize set or resize stop"
+      mkdir -p "$(dirname "$(resize_pid_file)")"
+      # `devicectl ... start` runs until interrupted and ends the session when it exits.
+      nohup xcrun devicectl device appResize start --device "$DEVICE" ${size:+--preferred-size "$size"} \
+        >"${TMPDIR:-/tmp}/duo-hinge/resize-$DEVICE.log" 2>&1 &
+      echo $! >"$(resize_pid_file)"
+      for _ in $(seq 1 20); do session_active && break; sleep 0.5; done
+      session_active || die "the resizable session did not start; see ${TMPDIR:-/tmp}/duo-hinge/resize-$DEVICE.log"
+      echo "size: $(settled_size)"
+      ;;
+    set)
+      [[ "$size" =~ ^[0-9]+x[0-9]+$ ]] || die "resize set needs <width>x<height> in points"
+      session_active || die "no resizable session; run resize start first"
+      local actual
+      actual="$(apply_size "$size")"
+      # The first portrait-to-landscape request after a portrait start lands on a 3:4 portrait size
+      # (600x800, then 1200x700 gives 525x700); asking again gives the requested size.
+      [[ "$actual" != "$size" ]] && actual="$(apply_size "$size")"
+      echo "requested: $size"
+      echo "size: $actual"
+      [[ "$actual" == "$size" ]] || echo "note: the system adjusted the request; see the limits in SKILL.md"
+      ;;
+    get)
+      session_active || die "no resizable session"
+      xcrun devicectl device info appResize --device "$DEVICE" 2>/dev/null | grep -E 'size' | sed 's/^ *//'
+      echo "size: $(settled_size)"
+      ;;
+    stop)
+      local pid
+      pid="$(cat "$(resize_pid_file)" 2>/dev/null || true)"
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill -INT "$pid"
+      else
+        pkill -INT -f "devicectl device appResize start --device $DEVICE" || true
+      fi
+      rm -f "$(resize_pid_file)"
+      for _ in $(seq 1 20); do session_active || break; sleep 0.5; done
+      session_active && die "the resizable session is still running"
+      echo "stopped"
+      ;;
+    *) die "usage: duo-hinge resize start [WxH] | set <WxH> | get | stop" ;;
+  esac
+}
+
 set_angle() {
   xcrun simctl spawn "$DEVICE" "$(helper_path)" set "$1"
   sleep "$SETTLE_SECONDS"
@@ -60,5 +151,6 @@ case "${1:-}" in
     echo "angle: $(xcrun simctl spawn "$DEVICE" "$(helper_path)" get)"
     xcrun devicectl device info displays --device "$DEVICE" 2>/dev/null | grep -E ' name: | active: | nativeSize: |Main display orientation'
     ;;
-  *) die "usage: duo-hinge open | close | half | set <degrees> | get | status" ;;
+  resize) resize "${2:-}" "${3:-}" ;;
+  *) die "usage: duo-hinge open | close | half | set <degrees> | get | status | resize start [WxH] | set <WxH> | get | stop" ;;
 esac
